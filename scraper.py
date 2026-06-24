@@ -52,7 +52,6 @@ def scraper_api_get(url: str) -> str | None:
         "api_key": SCRAPER_API_KEY,
         "url": url,
         "render": "true",   # renders JS like a real browser
-        "premium": "true",  # residential IPs
     }
     try:
         resp = requests.get(api_url, params=params, timeout=120)
