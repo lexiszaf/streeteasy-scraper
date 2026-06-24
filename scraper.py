@@ -9,6 +9,7 @@ import os
 import smtplib
 import time
 import random
+import re
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime
@@ -17,19 +18,15 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 # ── Config ────────────────────────────────────────────────────────────────────
-ALERT_EMAIL   = "lexiszaf@gmail.com"
-FROM_EMAIL    = os.environ.get("GMAIL_USER", "")
-APP_PASSWORD  = os.environ.get("GMAIL_APP_PASSWORD", "")
+ALERT_EMAIL  = "lexiszaf@gmail.com"
+FROM_EMAIL   = os.environ.get("GMAIL_USER", "")
+APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 
-MAX_RENT      = 7000
-MIN_BEDS      = 1
-MAX_BEDS      = 3
-MIN_BATHS     = 1
+MAX_RENT     = 7000
+MIN_BEDS     = 1
+MAX_BEDS     = 3
 
-# 89th–103rd St UWS bounding box (approximate lat/lng)
-NEIGHBORHOODS = ["upper-west-side"]
-
-SEEN_FILE     = Path("data/seen_listings.json")
+SEEN_FILE    = Path("data/seen_listings.json")
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -48,14 +45,16 @@ def random_delay(min_s=1.5, max_s=4.0):
     time.sleep(random.uniform(min_s, max_s))
 
 
-def build_search_urls() -> list[str]:
-    """Build StreetEasy search URLs for 1BR, 2BR, 3BR."""
+def build_search_urls() -> list[tuple]:
+    """
+    StreetEasy rental search URL format (confirmed working):
+    /for-rent/upper-west-side?beds_min=1&beds_max=1&price_max=7000
+    """
     urls = []
     for beds in range(MIN_BEDS, MAX_BEDS + 1):
-        # StreetEasy URL format for rentals
         url = (
-            f"https://streeteasy.com/for-rent/upper-west-side/"
-            f"beds:{beds}|price:-{MAX_RENT}|bathrooms:{MIN_BATHS}"
+            f"https://streeteasy.com/for-rent/upper-west-side"
+            f"?beds_min={beds}&beds_max={beds}&price_max={MAX_RENT}"
         )
         urls.append((beds, url))
     return urls
@@ -65,19 +64,46 @@ def scrape_listings(page, url: str, beds: int) -> list[dict]:
     listings = []
 
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        random_delay(2, 5)
+        print(f"    Loading: {url}")
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        random_delay(3, 6)
 
-        # Scroll to trigger lazy loading
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-        random_delay(1, 2)
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        random_delay(1, 2)
+        # Scroll slowly to trigger lazy loading
+        for pct in [0.25, 0.5, 0.75, 1.0]:
+            page.evaluate(f"window.scrollTo(0, document.body.scrollHeight * {pct})")
+            random_delay(0.8, 1.5)
 
-        # Wait for listing cards
-        page.wait_for_selector('[data-testid="listing-card"], .listingCard, article[data-id]', timeout=15000)
+        # Try multiple possible card selectors StreetEasy has used
+        selectors = [
+            'article[data-id]',
+            '[data-testid="listing-card"]',
+            '.listingCard',
+            'li[data-id]',
+            'div[data-listing-id]',
+            '.search-results article',
+            '.listings-container article',
+        ]
 
-        cards = page.query_selector_all('[data-testid="listing-card"], .listingCard, article[data-id]')
+        cards = []
+        for sel in selectors:
+            try:
+                page.wait_for_selector(sel, timeout=8000)
+                cards = page.query_selector_all(sel)
+                if cards:
+                    print(f"    Selector matched '{sel}': {len(cards)} cards")
+                    break
+            except Exception:
+                continue
+
+        if not cards:
+            # Dump page title to help debug
+            title = page.title()
+            print(f"    No cards found. Page title: '{title}'")
+            # Check if it's a CAPTCHA/block page
+            content = page.content()
+            if "captcha" in content.lower() or "robot" in content.lower() or "blocked" in content.lower():
+                print("    ⚠️  Likely blocked by bot detection")
+            return []
 
         for card in cards:
             try:
@@ -87,62 +113,93 @@ def scrape_listings(page, url: str, beds: int) -> list[dict]:
             except Exception:
                 continue
 
-        # Handle pagination — grab page 2 if present
-        next_btn = page.query_selector('a[aria-label="Next page"], .pagination-next a')
-        if next_btn and len(listings) > 0:
-            random_delay(2, 4)
-            next_btn.click()
-            page.wait_for_selector('[data-testid="listing-card"], .listingCard, article[data-id]', timeout=15000)
-            cards2 = page.query_selector_all('[data-testid="listing-card"], .listingCard, article[data-id]')
-            for card in cards2:
-                try:
-                    listing = parse_card(card, beds)
-                    if listing:
-                        listings.append(listing)
-                except Exception:
-                    continue
+        # Pagination: grab page 2 if there's a next button
+        try:
+            next_btn = page.query_selector('a[aria-label="Next page"], [data-testid="pagination-next"], .pagination-next a')
+            if next_btn and len(listings) > 0:
+                random_delay(2, 4)
+                next_btn.click()
+                page.wait_for_load_state("domcontentloaded")
+                random_delay(2, 3)
+                for sel in selectors:
+                    try:
+                        cards2 = page.query_selector_all(sel)
+                        if cards2:
+                            for card in cards2:
+                                try:
+                                    listing = parse_card(card, beds)
+                                    if listing:
+                                        listings.append(listing)
+                                except Exception:
+                                    continue
+                            break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
 
     except Exception as e:
-        print(f"  Error scraping {url}: {e}")
+        print(f"    Error scraping {url}: {e}")
 
     return listings
 
 
 def parse_card(card, beds: int) -> dict | None:
-    """Extract listing data from a card element."""
-    # Try to get the listing ID / URL
-    link = card.query_selector("a[href*='/rental/']")
+    # Get listing URL
+    link = card.query_selector("a[href*='/rental/'], a[href*='/for-rent/']")
     if not link:
-        link = card.query_selector("a[href*='/for-rent/']")
+        # Try any link inside the card
+        link = card.query_selector("a[href]")
     if not link:
         return None
 
     href = link.get_attribute("href") or ""
+    if not href:
+        return None
     if not href.startswith("http"):
         href = "https://streeteasy.com" + href
 
-    # Listing ID from URL
+    # Listing ID
     listing_id = href.rstrip("/").split("/")[-1]
-    if not listing_id:
+    if not listing_id or listing_id in ("for-rent", "upper-west-side"):
         return None
 
-    # Filter by street range (89th–103rd)
-    address_el = card.query_selector('[data-testid="listing-card-address"], .listingCard-addressLabel, .address')
-    address = address_el.inner_text().strip() if address_el else ""
+    # Address — try several selectors
+    address = ""
+    for sel in ['[data-testid="listing-card-address"]', '.listingCard-addressLabel',
+                '.address', 'address', 'h2', 'h3', '[class*="address"]']:
+        el = card.query_selector(sel)
+        if el:
+            address = el.inner_text().strip()
+            if address:
+                break
 
     if not is_in_range(address):
         return None
 
     # Price
-    price_el = card.query_selector('[data-testid="listing-card-price"], .listingCard-priceLabel, .price')
-    price_text = price_el.inner_text().strip() if price_el else ""
+    price_text = ""
+    for sel in ['[data-testid="listing-card-price"]', '.listingCard-priceLabel',
+                '.price', '[class*="price"]', '[class*="Price"]']:
+        el = card.query_selector(sel)
+        if el:
+            price_text = el.inner_text().strip()
+            if price_text:
+                break
+
     price = parse_price(price_text)
     if price and price > MAX_RENT:
         return None
 
-    # Baths
-    details_el = card.query_selector('[data-testid="listing-card-details"], .listingCard-details, .details')
-    details_text = details_el.inner_text().strip() if details_el else ""
+    # Details (beds/baths summary line)
+    details = ""
+    for sel in ['[data-testid="listing-card-details"]', '.listingCard-details',
+                '.details', '[class*="details"]', '[class*="Details"]']:
+        el = card.query_selector(sel)
+        if el:
+            details = el.inner_text().strip()
+            if details:
+                break
 
     return {
         "id": listing_id,
@@ -151,29 +208,28 @@ def parse_card(card, beds: int) -> dict | None:
         "price": price,
         "price_text": price_text,
         "beds": beds,
-        "details": details_text,
+        "details": details,
         "found_at": datetime.now().isoformat(),
     }
 
 
 def is_in_range(address: str) -> bool:
-    """Check if address is between 89th and 103rd street."""
+    """Check if address is between 89th and 103rd street. Include unknowns."""
     if not address:
-        return True  # include unknowns, better to over-notify
+        return True
 
-    import re
-    # Look for street numbers like "90th", "West 95", "W 102", "102nd", etc.
-    match = re.search(r'(?:West\s+|W\.?\s+|East\s+|E\.?\s+)?(\d{2,3})(?:st|nd|rd|th)?\s+St', address, re.IGNORECASE)
+    match = re.search(
+        r'(?:West\s+|W\.?\s+|East\s+|E\.?\s+)?(\d{2,3})(?:st|nd|rd|th)?\s+St',
+        address, re.IGNORECASE
+    )
     if match:
         street_num = int(match.group(1))
         return 89 <= street_num <= 103
 
-    # If we can't parse it, include it (don't miss listings)
-    return True
+    return True  # include if can't parse — better to over-notify
 
 
 def parse_price(price_text: str) -> int | None:
-    import re
     match = re.search(r'[\$]?([\d,]+)', price_text)
     if match:
         return int(match.group(1).replace(",", ""))
@@ -182,7 +238,7 @@ def parse_price(price_text: str) -> int | None:
 
 def send_email(new_listings: list[dict]):
     if not FROM_EMAIL or not APP_PASSWORD:
-        print("⚠️  No email credentials set — printing listings instead:")
+        print("⚠️  No email credentials — printing listings instead:")
         for l in new_listings:
             print(f"  {l['address']} | {l['price_text']} | {l['beds']}BR | {l['url']}")
         return
@@ -207,14 +263,21 @@ def send_email(new_listings: list[dict]):
 def build_email_html(listings: list[dict]) -> str:
     cards_html = ""
     for l in listings:
-        beds_label = f"{l['beds']} Bed{'s' if l['beds'] != 1 else ''}"
+        beds_label  = f"{l['beds']} Bed{'s' if l['beds'] != 1 else ''}"
         price_label = l["price_text"] or "Price N/A"
-        address = l["address"] or "Address N/A"
-        details = l["details"] or ""
+        address     = l["address"] or "Address N/A"
+        details     = l["details"] or ""
 
         tour_subject = f"Tour Request - {address}"
-        tour_body = f"Hi, I'm interested in the apartment at {address} listed on StreetEasy. Could we schedule a tour? Also, is the layout flexible (would you allow a temporary wall to add a room)? Thank you!"
-        mailto = f"mailto:?subject={tour_subject.replace(' ', '%20')}&body={tour_body.replace(' ', '%20').replace(',', '%2C')}"
+        tour_body    = (
+            f"Hi, I'm interested in the apartment at {address} listed on StreetEasy. "
+            f"Could we schedule a tour? Also, is the layout flexible "
+            f"(would you allow a temporary wall to add a room)? Thank you!"
+        )
+        mailto = (
+            f"mailto:?subject={tour_subject.replace(' ', '%20')}"
+            f"&body={tour_body.replace(' ', '%20').replace(',', '%2C')}"
+        )
 
         cards_html += f"""
         <div style="background:#fff;border:1px solid #e0e0e0;border-radius:12px;padding:20px;margin-bottom:16px;">
@@ -258,29 +321,50 @@ def main():
                 "--no-sandbox",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
             ]
         )
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
             viewport={"width": 1280, "height": 900},
             locale="en-US",
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            }
         )
         # Mask webdriver flag
-        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = { runtime: {} };
+        """)
 
         page = context.new_page()
+
+        # Visit homepage first to get cookies (helps avoid bot detection)
+        print("  Warming up with homepage visit...")
+        try:
+            page.goto("https://streeteasy.com", wait_until="domcontentloaded", timeout=20000)
+            random_delay(2, 4)
+        except Exception:
+            pass
 
         for beds, url in build_search_urls():
             print(f"  Scraping {beds}BR listings...")
             listings = scrape_listings(page, url, beds)
-            print(f"    Found {len(listings)} listings on page")
+            print(f"    → {len(listings)} listings found")
 
             for listing in listings:
                 if listing["id"] not in seen:
                     new_listings.append(listing)
                     seen.add(listing["id"])
 
-            random_delay(3, 7)  # polite delay between searches
+            random_delay(4, 8)  # polite delay between searches
 
         browser.close()
 
