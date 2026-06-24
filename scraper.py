@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 StreetEasy UWS Apartment Scraper
-Scrapes listings daily and emails new ones to lexiszaf@gmail.com
+Uses ScraperAPI to bypass bot detection.
+Emails new listings to lexiszaf@gmail.com
 """
 
 import json
@@ -10,23 +11,26 @@ import smtplib
 import time
 import random
 import re
+import urllib.parse
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+import requests
+from bs4 import BeautifulSoup
 
 # ── Config ────────────────────────────────────────────────────────────────────
-ALERT_EMAIL  = "lexiszaf@gmail.com"
-FROM_EMAIL   = os.environ.get("GMAIL_USER", "")
-APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
+ALERT_EMAIL    = "lexiszaf@gmail.com"
+FROM_EMAIL     = os.environ.get("GMAIL_USER", "")
+APP_PASSWORD   = os.environ.get("GMAIL_APP_PASSWORD", "")
+SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
 
-MAX_RENT     = 7000
-MIN_BEDS     = 1
-MAX_BEDS     = 3
+MAX_RENT       = 7000
+MIN_BEDS       = 1
+MAX_BEDS       = 3
 
-SEEN_FILE    = Path("data/seen_listings.json")
+SEEN_FILE      = Path("data/seen_listings.json")
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -41,15 +45,28 @@ def save_seen(seen: set):
     SEEN_FILE.write_text(json.dumps(sorted(seen), indent=2))
 
 
-def random_delay(min_s=1.5, max_s=4.0):
-    time.sleep(random.uniform(min_s, max_s))
+def scraper_api_get(url: str) -> str | None:
+    """Fetch a URL through ScraperAPI to bypass bot detection."""
+    api_url = "http://api.scraperapi.com"
+    params = {
+        "api_key": SCRAPER_API_KEY,
+        "url": url,
+        "render": "true",   # renders JS like a real browser
+        "premium": "true",  # residential IPs
+    }
+    try:
+        resp = requests.get(api_url, params=params, timeout=120)
+        if resp.status_code == 200:
+            return resp.text
+        else:
+            print(f"    ScraperAPI returned {resp.status_code} for {url}")
+            return None
+    except Exception as e:
+        print(f"    ScraperAPI error: {e}")
+        return None
 
 
 def build_search_urls() -> list[tuple]:
-    """
-    StreetEasy rental search URL format (confirmed working):
-    /for-rent/upper-west-side?beds_min=1&beds_max=1&price_max=7000
-    """
     urls = []
     for beds in range(MIN_BEDS, MAX_BEDS + 1):
         url = (
@@ -60,118 +77,75 @@ def build_search_urls() -> list[tuple]:
     return urls
 
 
-def scrape_listings(page, url: str, beds: int) -> list[dict]:
+def scrape_listings(beds: int, url: str) -> list[dict]:
+    print(f"    Fetching: {url}")
+    html = scraper_api_get(url)
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Check if blocked
+    title = soup.title.string if soup.title else ""
+    print(f"    Page title: '{title}'")
+    if "denied" in title.lower() or "captcha" in title.lower():
+        print("    ⚠️  Still blocked even with ScraperAPI")
+        return []
+
     listings = []
 
-    try:
-        print(f"    Loading: {url}")
-        page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        random_delay(3, 6)
+    # StreetEasy listing cards
+    cards = (
+        soup.find_all("article", attrs={"data-id": True}) or
+        soup.find_all("li", attrs={"data-id": True}) or
+        soup.find_all(attrs={"data-testid": "listing-card"}) or
+        soup.find_all("div", attrs={"data-listing-id": True}) or
+        soup.select(".listingCard") or
+        soup.select("article")
+    )
 
-        # Scroll slowly to trigger lazy loading
-        for pct in [0.25, 0.5, 0.75, 1.0]:
-            page.evaluate(f"window.scrollTo(0, document.body.scrollHeight * {pct})")
-            random_delay(0.8, 1.5)
+    print(f"    Found {len(cards)} cards")
 
-        # Try multiple possible card selectors StreetEasy has used
-        selectors = [
-            'article[data-id]',
-            '[data-testid="listing-card"]',
-            '.listingCard',
-            'li[data-id]',
-            'div[data-listing-id]',
-            '.search-results article',
-            '.listings-container article',
-        ]
-
-        cards = []
-        for sel in selectors:
-            try:
-                page.wait_for_selector(sel, timeout=8000)
-                cards = page.query_selector_all(sel)
-                if cards:
-                    print(f"    Selector matched '{sel}': {len(cards)} cards")
-                    break
-            except Exception:
-                continue
-
-        if not cards:
-            # Dump page title to help debug
-            title = page.title()
-            print(f"    No cards found. Page title: '{title}'")
-            # Check if it's a CAPTCHA/block page
-            content = page.content()
-            if "captcha" in content.lower() or "robot" in content.lower() or "blocked" in content.lower():
-                print("    ⚠️  Likely blocked by bot detection")
-            return []
-
-        for card in cards:
-            try:
-                listing = parse_card(card, beds)
-                if listing:
-                    listings.append(listing)
-            except Exception:
-                continue
-
-        # Pagination: grab page 2 if there's a next button
+    for card in cards:
         try:
-            next_btn = page.query_selector('a[aria-label="Next page"], [data-testid="pagination-next"], .pagination-next a')
-            if next_btn and len(listings) > 0:
-                random_delay(2, 4)
-                next_btn.click()
-                page.wait_for_load_state("domcontentloaded")
-                random_delay(2, 3)
-                for sel in selectors:
-                    try:
-                        cards2 = page.query_selector_all(sel)
-                        if cards2:
-                            for card in cards2:
-                                try:
-                                    listing = parse_card(card, beds)
-                                    if listing:
-                                        listings.append(listing)
-                                except Exception:
-                                    continue
-                            break
-                    except Exception:
-                        continue
+            listing = parse_card(card, beds)
+            if listing:
+                listings.append(listing)
         except Exception:
-            pass
-
-    except Exception as e:
-        print(f"    Error scraping {url}: {e}")
+            continue
 
     return listings
 
 
 def parse_card(card, beds: int) -> dict | None:
-    # Get listing URL
-    link = card.query_selector("a[href*='/rental/'], a[href*='/for-rent/']")
+    # URL / ID
+    link = card.find("a", href=re.compile(r"/rental/|/for-rent/"))
     if not link:
-        # Try any link inside the card
-        link = card.query_selector("a[href]")
+        link = card.find("a", href=True)
     if not link:
         return None
 
-    href = link.get_attribute("href") or ""
-    if not href:
-        return None
+    href = link.get("href", "")
     if not href.startswith("http"):
         href = "https://streeteasy.com" + href
 
-    # Listing ID
     listing_id = href.rstrip("/").split("/")[-1]
     if not listing_id or listing_id in ("for-rent", "upper-west-side"):
         return None
 
-    # Address — try several selectors
+    # Address
     address = ""
-    for sel in ['[data-testid="listing-card-address"]', '.listingCard-addressLabel',
-                '.address', 'address', 'h2', 'h3', '[class*="address"]']:
-        el = card.query_selector(sel)
+    for sel in ["[data-testid='listing-card-address']", ".listingCard-addressLabel", "address"]:
+        el = card.select_one(sel)
         if el:
-            address = el.inner_text().strip()
-            if address:
+            address = el.get_text(strip=True)
+            break
+    if not address:
+        # fallback: grab first h2/h3
+        for tag in ["h2", "h3", "h4"]:
+            el = card.find(tag)
+            if el:
+                address = el.get_text(strip=True)
                 break
 
     if not is_in_range(address):
@@ -179,27 +153,28 @@ def parse_card(card, beds: int) -> dict | None:
 
     # Price
     price_text = ""
-    for sel in ['[data-testid="listing-card-price"]', '.listingCard-priceLabel',
-                '.price', '[class*="price"]', '[class*="Price"]']:
-        el = card.query_selector(sel)
+    for sel in ["[data-testid='listing-card-price']", ".listingCard-priceLabel", ".price"]:
+        el = card.select_one(sel)
         if el:
-            price_text = el.inner_text().strip()
-            if price_text:
-                break
+            price_text = el.get_text(strip=True)
+            break
+    if not price_text:
+        # look for any element containing a dollar sign
+        for el in card.find_all(string=re.compile(r'\$[\d,]+')):
+            price_text = el.strip()
+            break
 
     price = parse_price(price_text)
     if price and price > MAX_RENT:
         return None
 
-    # Details (beds/baths summary line)
+    # Details
     details = ""
-    for sel in ['[data-testid="listing-card-details"]', '.listingCard-details',
-                '.details', '[class*="details"]', '[class*="Details"]']:
-        el = card.query_selector(sel)
+    for sel in ["[data-testid='listing-card-details']", ".listingCard-details", ".details"]:
+        el = card.select_one(sel)
         if el:
-            details = el.inner_text().strip()
-            if details:
-                break
+            details = el.get_text(strip=True)
+            break
 
     return {
         "id": listing_id,
@@ -214,23 +189,19 @@ def parse_card(card, beds: int) -> dict | None:
 
 
 def is_in_range(address: str) -> bool:
-    """Check if address is between 89th and 103rd street. Include unknowns."""
     if not address:
         return True
-
     match = re.search(
         r'(?:West\s+|W\.?\s+|East\s+|E\.?\s+)?(\d{2,3})(?:st|nd|rd|th)?\s+St',
         address, re.IGNORECASE
     )
     if match:
-        street_num = int(match.group(1))
-        return 89 <= street_num <= 103
-
-    return True  # include if can't parse — better to over-notify
+        return 89 <= int(match.group(1)) <= 103
+    return True
 
 
 def parse_price(price_text: str) -> int | None:
-    match = re.search(r'[\$]?([\d,]+)', price_text)
+    match = re.search(r'\$?([\d,]+)', price_text or "")
     if match:
         return int(match.group(1).replace(",", ""))
     return None
@@ -238,7 +209,7 @@ def parse_price(price_text: str) -> int | None:
 
 def send_email(new_listings: list[dict]):
     if not FROM_EMAIL or not APP_PASSWORD:
-        print("⚠️  No email credentials — printing listings instead:")
+        print("⚠️  No email credentials — printing listings:")
         for l in new_listings:
             print(f"  {l['address']} | {l['price_text']} | {l['beds']}BR | {l['url']}")
         return
@@ -247,9 +218,7 @@ def send_email(new_listings: list[dict]):
     msg["Subject"] = f"🏠 {len(new_listings)} New UWS Listing{'s' if len(new_listings) != 1 else ''} — {datetime.now().strftime('%b %d')}"
     msg["From"]    = FROM_EMAIL
     msg["To"]      = ALERT_EMAIL
-
-    html = build_email_html(new_listings)
-    msg.attach(MIMEText(html, "html"))
+    msg.attach(MIMEText(build_email_html(new_listings), "html"))
 
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
@@ -267,17 +236,13 @@ def build_email_html(listings: list[dict]) -> str:
         price_label = l["price_text"] or "Price N/A"
         address     = l["address"] or "Address N/A"
         details     = l["details"] or ""
-
-        tour_subject = f"Tour Request - {address}"
-        tour_body    = (
+        tour_subject = urllib.parse.quote(f"Tour Request - {address}")
+        tour_body    = urllib.parse.quote(
             f"Hi, I'm interested in the apartment at {address} listed on StreetEasy. "
             f"Could we schedule a tour? Also, is the layout flexible "
             f"(would you allow a temporary wall to add a room)? Thank you!"
         )
-        mailto = (
-            f"mailto:?subject={tour_subject.replace(' ', '%20')}"
-            f"&body={tour_body.replace(' ', '%20').replace(',', '%2C')}"
-        )
+        mailto = f"mailto:?subject={tour_subject}&body={tour_body}"
 
         cards_html += f"""
         <div style="background:#fff;border:1px solid #e0e0e0;border-radius:12px;padding:20px;margin-bottom:16px;">
@@ -291,8 +256,7 @@ def build_email_html(listings: list[dict]) -> str:
         </div>
         """
 
-    return f"""
-    <!DOCTYPE html>
+    return f"""<!DOCTYPE html>
     <html>
     <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;margin:0;padding:20px;">
       <div style="max-width:600px;margin:0 auto;">
@@ -300,73 +264,35 @@ def build_email_html(listings: list[dict]) -> str:
           <h1 style="color:#fff;margin:0;font-size:24px;">🏠 New UWS Listings</h1>
           <p style="color:#cce0ff;margin:8px 0 0;">{datetime.now().strftime('%A, %B %d, %Y')} &nbsp;·&nbsp; 89th–103rd St &nbsp;·&nbsp; Up to $7,000/mo</p>
         </div>
-        <p style="color:#444;margin-bottom:20px;">{len(listings)} new listing{'s' if len(listings) != 1 else ''} found since your last check:</p>
+        <p style="color:#444;margin-bottom:20px;">{len(listings)} new listing{'s' if len(listings) != 1 else ''} since your last check:</p>
         {cards_html}
-        <p style="color:#999;font-size:12px;text-align:center;margin-top:24px;">UWS Scraper · Runs daily · Filters: 1–3BR, 1+ bath, ≤$7,000</p>
+        <p style="color:#999;font-size:12px;text-align:center;margin-top:24px;">UWS Scraper · Runs daily at 8am ET · 1–3BR · ≤$7,000</p>
       </div>
     </body>
-    </html>
-    """
+    </html>"""
 
 
 def main():
     print(f"🔍 Starting StreetEasy scrape — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+    if not SCRAPER_API_KEY:
+        print("❌ SCRAPER_API_KEY not set!")
+        return
+
     seen = load_seen()
     new_listings = []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--disable-web-security",
-                "--disable-features=IsolateOrigins,site-per-process",
-            ]
-        )
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 900},
-            locale="en-US",
-            extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            }
-        )
-        # Mask webdriver flag
-        context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            window.chrome = { runtime: {} };
-        """)
+    for beds, url in build_search_urls():
+        print(f"  Scraping {beds}BR listings...")
+        listings = scrape_listings(beds, url)
+        print(f"    → {len(listings)} listings found")
 
-        page = context.new_page()
+        for listing in listings:
+            if listing["id"] not in seen:
+                new_listings.append(listing)
+                seen.add(listing["id"])
 
-        # Visit homepage first to get cookies (helps avoid bot detection)
-        print("  Warming up with homepage visit...")
-        try:
-            page.goto("https://streeteasy.com", wait_until="domcontentloaded", timeout=20000)
-            random_delay(2, 4)
-        except Exception:
-            pass
-
-        for beds, url in build_search_urls():
-            print(f"  Scraping {beds}BR listings...")
-            listings = scrape_listings(page, url, beds)
-            print(f"    → {len(listings)} listings found")
-
-            for listing in listings:
-                if listing["id"] not in seen:
-                    new_listings.append(listing)
-                    seen.add(listing["id"])
-
-            random_delay(4, 8)  # polite delay between searches
-
-        browser.close()
+        time.sleep(random.uniform(2, 4))
 
     print(f"\n📬 {len(new_listings)} new listings to report.")
 
